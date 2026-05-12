@@ -1,70 +1,41 @@
-import { GoogleGenAI, Type } from '@google/genai'
+import Groq from 'groq-sdk'
 import { NextRequest, NextResponse } from 'next/server'
 import { AnalysisResult, ApiResponse } from '@/types'
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 })
 
-const MODEL = 'gemini-2.5-flash'
+// Llama 3.3 70B — excelente en español, soporta JSON mode, 14.400 req/día gratis
+const MODEL = 'llama-3.3-70b-versatile'
 
-const SYSTEM_PROMPT = `Eres un experto pedagogo español especializado en crear material de estudio eficaz para estudiantes de ESO, Bachillerato, Universidad y Oposiciones. Tu tarea es analizar los apuntes del estudiante y generar tres elementos de alta calidad educativa.
+const SYSTEM_PROMPT = `Eres un experto pedagogo español especializado en crear material de estudio eficaz para estudiantes de ESO, Bachillerato, Universidad y Oposiciones.
 
-REGLAS DE CONTENIDO:
-- ESQUEMA: Jerárquico, numerado (1. 1.1 1.1.1...), completo, máximo 30 puntos, ordenado lógicamente, separado por saltos de línea \\n
-- RESUMEN: Exactamente entre 5 y 7 puntos clave. Cada punto autocontenido y claro
-- TEST: Exactamente 10 preguntas. Dificultad variada (3 fáciles, 4 medias, 3 difíciles). Todas las opciones plausibles. Ninguna respuesta obvia sin leer el material
-- Escribe siempre en español de España
-- Usa los nombres exactos de claves: esquema, resumen, test, pregunta, opciones, A, B, C, D, respuesta_correcta, explicacion`
+Tu tarea es analizar los apuntes del estudiante y generar tres elementos de alta calidad educativa.
 
-// JSON Schema for structured output — Gemini guarantees this shape
-const RESPONSE_SCHEMA = {
-  type: Type.OBJECT,
-  properties: {
-    esquema: {
-      type: Type.STRING,
-      description: 'Esquema jerárquico numerado completo, separado por \\n',
-    },
-    resumen: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: 'Entre 5 y 7 puntos clave',
-      minItems: '5',
-      maxItems: '7',
-    },
-    test: {
-      type: Type.ARRAY,
-      minItems: '10',
-      maxItems: '10',
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          pregunta: { type: Type.STRING },
-          opciones: {
-            type: Type.OBJECT,
-            properties: {
-              A: { type: Type.STRING },
-              B: { type: Type.STRING },
-              C: { type: Type.STRING },
-              D: { type: Type.STRING },
-            },
-            required: ['A', 'B', 'C', 'D'],
-            propertyOrdering: ['A', 'B', 'C', 'D'],
-          },
-          respuesta_correcta: {
-            type: Type.STRING,
-            enum: ['A', 'B', 'C', 'D'],
-          },
-          explicacion: { type: Type.STRING },
-        },
-        required: ['pregunta', 'opciones', 'respuesta_correcta', 'explicacion'],
-        propertyOrdering: ['pregunta', 'opciones', 'respuesta_correcta', 'explicacion'],
-      },
-    },
-  },
-  required: ['esquema', 'resumen', 'test'],
-  propertyOrdering: ['esquema', 'resumen', 'test'],
+DEBES responder EXCLUSIVAMENTE con un objeto JSON válido con esta estructura EXACTA:
+
+{
+  "esquema": "string con esquema jerárquico numerado (1. 1.1 1.1.1...) separado por saltos de línea \\n",
+  "resumen": ["punto 1", "punto 2", "punto 3", "punto 4", "punto 5"],
+  "test": [
+    {
+      "pregunta": "¿texto?",
+      "opciones": { "A": "...", "B": "...", "C": "...", "D": "..." },
+      "respuesta_correcta": "A",
+      "explicacion": "breve explicación"
+    }
+  ]
 }
+
+REGLAS ESTRICTAS DE CONTENIDO:
+- ESQUEMA: Jerárquico, numerado, máximo 30 puntos, lógicamente ordenado
+- RESUMEN: Array con EXACTAMENTE entre 5 y 7 strings. Cada punto autocontenido y claro
+- TEST: Array con EXACTAMENTE 10 preguntas. Dificultad variada: 3 fáciles, 4 medias, 3 difíciles. Todas las opciones plausibles, ninguna respuesta obvia
+- respuesta_correcta debe ser SIEMPRE una de: "A", "B", "C" o "D"
+- Escribe siempre en español de España
+- NO incluyas markdown, NO uses bloques de código, NO añadas texto antes o después del JSON
+- El JSON debe ser parseable directamente con JSON.parse()`
 
 export async function POST(req: NextRequest): Promise<NextResponse<ApiResponse<AnalysisResult>>> {
   try {
@@ -94,35 +65,37 @@ export async function POST(req: NextRequest): Promise<NextResponse<ApiResponse<A
       )
     }
 
-    if (!process.env.GEMINI_API_KEY) {
+    if (!process.env.GROQ_API_KEY) {
       return NextResponse.json(
         { success: false, error: 'Error de configuración del servidor. Contacta con soporte.' },
         { status: 500 }
       )
     }
 
-    const response = await ai.models.generateContent({
+    const completion = await groq.chat.completions.create({
       model: MODEL,
-      contents: `Analiza estos apuntes y genera el esquema, resumen y test según las instrucciones:\n\n${trimmed}`,
-      config: {
-        systemInstruction: SYSTEM_PROMPT,
-        responseMimeType: 'application/json',
-        responseSchema: RESPONSE_SCHEMA,
-        temperature: 0.7,
-        maxOutputTokens: 8192,
-      },
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: `Analiza estos apuntes y genera el esquema, resumen y test según las instrucciones. Devuelve SOLO JSON válido:\n\n${trimmed}`,
+        },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.6,
+      max_tokens: 8192,
     })
 
-    const rawText = response.text
-    if (!rawText) {
+    const rawContent = completion.choices[0]?.message?.content
+    if (!rawContent) {
       throw new Error('Respuesta vacía de la IA')
     }
 
     let parsed: AnalysisResult
     try {
-      parsed = JSON.parse(rawText) as AnalysisResult
+      parsed = JSON.parse(rawContent) as AnalysisResult
     } catch {
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/)
+      const jsonMatch = rawContent.match(/\{[\s\S]*\}/)
       if (!jsonMatch) {
         throw new Error('No se pudo parsear la respuesta de la IA')
       }
@@ -144,15 +117,16 @@ export async function POST(req: NextRequest): Promise<NextResponse<ApiResponse<A
     console.error('Error en /api/analyze:', error)
 
     const message = error instanceof Error ? error.message : 'Error desconocido'
+    const lower = message.toLowerCase()
 
-    if (message.toLowerCase().includes('api key') || message.toLowerCase().includes('api_key')) {
+    if (lower.includes('api key') || lower.includes('api_key') || lower.includes('authentication') || lower.includes('unauthorized')) {
       return NextResponse.json(
         { success: false, error: 'Error de configuración del servidor. Contacta con soporte.' },
         { status: 500 }
       )
     }
 
-    if (message.toLowerCase().includes('quota') || message.toLowerCase().includes('rate limit')) {
+    if (lower.includes('rate') || lower.includes('quota') || lower.includes('limit')) {
       return NextResponse.json(
         { success: false, error: 'Límite de uso temporal alcanzado. Inténtalo de nuevo en unos minutos.' },
         { status: 429 }
