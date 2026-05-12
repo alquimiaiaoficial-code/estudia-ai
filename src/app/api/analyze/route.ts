@@ -1,43 +1,70 @@
-import Anthropic from '@anthropic-ai/sdk'
+import { GoogleGenAI, Type } from '@google/genai'
 import { NextRequest, NextResponse } from 'next/server'
 import { AnalysisResult, ApiResponse } from '@/types'
 
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
 })
+
+const MODEL = 'gemini-2.5-flash'
 
 const SYSTEM_PROMPT = `Eres un experto pedagogo español especializado en crear material de estudio eficaz para estudiantes de ESO, Bachillerato, Universidad y Oposiciones. Tu tarea es analizar los apuntes del estudiante y generar tres elementos de alta calidad educativa.
 
-INSTRUCCIONES ESTRICTAS:
-- Responde ÚNICAMENTE con un objeto JSON válido, sin texto adicional antes ni después
-- No uses bloques de código markdown (sin \`\`\`json)
-- No añadas comentarios dentro del JSON
-- El JSON debe ser parseable directamente con JSON.parse()
-
-ESTRUCTURA JSON OBLIGATORIA:
-{
-  "esquema": "string con el esquema jerárquico completo usando numeración 1. 1.1 1.1.1 etc., separado por saltos de línea \\n",
-  "resumen": ["punto clave 1", "punto clave 2", "punto clave 3", "punto clave 4", "punto clave 5"],
-  "test": [
-    {
-      "pregunta": "¿Texto de la pregunta?",
-      "opciones": {
-        "A": "Primera opción",
-        "B": "Segunda opción",
-        "C": "Tercera opción",
-        "D": "Cuarta opción"
-      },
-      "respuesta_correcta": "A",
-      "explicacion": "Explicación breve de por qué A es correcta y las demás no"
-    }
-  ]
-}
-
 REGLAS DE CONTENIDO:
-- ESQUEMA: Jerárquico, numerado, completo, máximo 30 puntos, ordenado lógicamente
-- RESUMEN: Exactamente entre 5 y 7 strings en el array. Cada punto autocontenido y claro
+- ESQUEMA: Jerárquico, numerado (1. 1.1 1.1.1...), completo, máximo 30 puntos, ordenado lógicamente, separado por saltos de línea \\n
+- RESUMEN: Exactamente entre 5 y 7 puntos clave. Cada punto autocontenido y claro
 - TEST: Exactamente 10 preguntas. Dificultad variada (3 fáciles, 4 medias, 3 difíciles). Todas las opciones plausibles. Ninguna respuesta obvia sin leer el material
-- Escribe siempre en español de España`
+- Escribe siempre en español de España
+- Usa los nombres exactos de claves: esquema, resumen, test, pregunta, opciones, A, B, C, D, respuesta_correcta, explicacion`
+
+// JSON Schema for structured output — Gemini guarantees this shape
+const RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    esquema: {
+      type: Type.STRING,
+      description: 'Esquema jerárquico numerado completo, separado por \\n',
+    },
+    resumen: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: 'Entre 5 y 7 puntos clave',
+      minItems: '5',
+      maxItems: '7',
+    },
+    test: {
+      type: Type.ARRAY,
+      minItems: '10',
+      maxItems: '10',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          pregunta: { type: Type.STRING },
+          opciones: {
+            type: Type.OBJECT,
+            properties: {
+              A: { type: Type.STRING },
+              B: { type: Type.STRING },
+              C: { type: Type.STRING },
+              D: { type: Type.STRING },
+            },
+            required: ['A', 'B', 'C', 'D'],
+            propertyOrdering: ['A', 'B', 'C', 'D'],
+          },
+          respuesta_correcta: {
+            type: Type.STRING,
+            enum: ['A', 'B', 'C', 'D'],
+          },
+          explicacion: { type: Type.STRING },
+        },
+        required: ['pregunta', 'opciones', 'respuesta_correcta', 'explicacion'],
+        propertyOrdering: ['pregunta', 'opciones', 'respuesta_correcta', 'explicacion'],
+      },
+    },
+  },
+  required: ['esquema', 'resumen', 'test'],
+  propertyOrdering: ['esquema', 'resumen', 'test'],
+}
 
 export async function POST(req: NextRequest): Promise<NextResponse<ApiResponse<AnalysisResult>>> {
   try {
@@ -67,29 +94,35 @@ export async function POST(req: NextRequest): Promise<NextResponse<ApiResponse<A
       )
     }
 
-    const message = await client.messages.create({
-      model: 'claude-opus-4-5',
-      max_tokens: 4096,
-      system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: `Analiza estos apuntes y genera el esquema, resumen y test según las instrucciones:\n\n${trimmed}`,
-        },
-      ],
+    if (!process.env.GEMINI_API_KEY) {
+      return NextResponse.json(
+        { success: false, error: 'Error de configuración del servidor. Contacta con soporte.' },
+        { status: 500 }
+      )
+    }
+
+    const response = await ai.models.generateContent({
+      model: MODEL,
+      contents: `Analiza estos apuntes y genera el esquema, resumen y test según las instrucciones:\n\n${trimmed}`,
+      config: {
+        systemInstruction: SYSTEM_PROMPT,
+        responseMimeType: 'application/json',
+        responseSchema: RESPONSE_SCHEMA,
+        temperature: 0.7,
+        maxOutputTokens: 8192,
+      },
     })
 
-    const rawContent = message.content[0]
-    if (rawContent.type !== 'text') {
-      throw new Error('Respuesta inesperada de la IA')
+    const rawText = response.text
+    if (!rawText) {
+      throw new Error('Respuesta vacía de la IA')
     }
 
     let parsed: AnalysisResult
     try {
-      parsed = JSON.parse(rawContent.text) as AnalysisResult
+      parsed = JSON.parse(rawText) as AnalysisResult
     } catch {
-      // Intento de recuperación: buscar JSON en la respuesta
-      const jsonMatch = rawContent.text.match(/\{[\s\S]*\}/)
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/)
       if (!jsonMatch) {
         throw new Error('No se pudo parsear la respuesta de la IA')
       }
@@ -112,10 +145,17 @@ export async function POST(req: NextRequest): Promise<NextResponse<ApiResponse<A
 
     const message = error instanceof Error ? error.message : 'Error desconocido'
 
-    if (message.includes('API key')) {
+    if (message.toLowerCase().includes('api key') || message.toLowerCase().includes('api_key')) {
       return NextResponse.json(
         { success: false, error: 'Error de configuración del servidor. Contacta con soporte.' },
         { status: 500 }
+      )
+    }
+
+    if (message.toLowerCase().includes('quota') || message.toLowerCase().includes('rate limit')) {
+      return NextResponse.json(
+        { success: false, error: 'Límite de uso temporal alcanzado. Inténtalo de nuevo en unos minutos.' },
+        { status: 429 }
       )
     }
 
